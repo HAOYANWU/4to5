@@ -1,0 +1,1368 @@
+; Filename: AE.FIS
+;
+; PURPOSE:  Acoustic-emission monitoring package for PFC2D
+;
+; NOMENCLATURE:   ae - refers to individual bond breakage (crack) or sub-event
+;                 aec - refers to seismic event - possibly a cluster of cracks
+;
+;
+; PACKAGE USE:
+;       1) When ready for acoustic-emission monitoring to begin, execute
+;          [ae_init].  All subsequent bond breakages will contribute to
+;          AE events.
+;       2) When a bond breakage (crack) occurs, the forces will be integrated around the crack
+;          by observing all contacts of the two balls on either side of the crack
+;          The moment tensor will be calculated each time step and the magnitude will be 
+;          calculated from the elements of the moment tensor matrix
+;          The MT and magnitude of the event will be the maximum observed over the event duration
+;       3) To calculate the event duration, a shear velocity must be entered
+;          (ae_svel).  This can be calculated reasonably accurately from the elastic constants
+;           determined from core compaction tests as follows:
+;           Vp = sqrt(E/density), where density is the particle density times (1 - porosity)
+;           Vs = Vp * sqrt((0.5-v/(1-v)) where v is the poisson's ratio
+;           Event duration is then _ae_time = 2*md_ravg/(0.5*ae_svel) ... (should be about 20 steps)
+;       4)  Damping is set to maximum (alpha = 0.7) until a crack occurs at which time the damping is
+;           set to a low level which is calculated from the user-specified quality factor, Q by
+;           alpha = pi/2Q, where alpha is the PFC damping coefficient
+;           When no events are active, damping reverts back to full.
+;       5) Clustering occurs when a crack forms and the areas of integration overlap (ie a
+;          contact is shared.  When this happens, all new contacts are added to the integration surface
+;          and internal contacts are removed
+; 
+; INPUT:
+;          ae_svel:  Shear velocity of the material in m/s
+;          ae_Q   :  Seismic quality factor Q of the rock
+;
+; MODIFICATIONS TO BE DONE:
+;
+;       1) Investigate more rigorous technique for centroid determination.  At present,
+;          geometric centroid is used.
+;       2) Include effect of parallel bond moments - NOTE this effect is probably v. small
+;       3) Could make this more efficient by creating a linked list of active events however I couldn't
+;          get this to work properly with the merge function
+;
+;
+; HISTORY:  created    JFH             31 May 2001
+;               mod.   JFH             5 June 2001 - included clustering
+;               mod.   JFH             14 June 2001 - included merging
+;               mod.   JFH             07 Jan  2002  - make contact offsets names instead of numbers
+;               mod.   HYW             12 Dec  2015  - in PFC5.0
+; ===================================================================
+;
+;       Single AE (cracks) occur when a bond breaks.
+;       Each single AE (crack) has an ae-datablock associated with itself.
+;       All datablocks are stored in a linked list w/ header obtained from
+;       the AEC datablock (see below)
+;       If the event is new (ie not within the confines of an exisiting event), then an AEC datablock
+;       is generated
+;       Whenever a bond breaks that is within the confines of an active event
+;       (see above), an AE-datablock is created and added to the
+;       llist that is pointed to from the AEC datablock
+;
+;
+;The contents of the ae_datablock are as follows
+;
+;       (0 - ae_NEXT)  - ptr. to next datablock in llist
+;       (1 - ae_BALL1) - pointer to ball 1 of the crack
+;       (2 - ae_BALL2) - pointer to ball 2 of the crack
+;       (3 - ae_CYC)   - integer of time of bond breakage
+;       (4 - ae_FAIL)  - integer bond failure indicator
+;		             (0=not set; 1=contact  bond failed normal;
+;				             2=contact  bond failed shear;
+;				             3=parallel bond failed normal;
+;			                   4=parallel bond failed shear)
+;
+;;The contents of the aec_datablock are as follows
+;
+;       (0 - aec_NEXT) - ptr. to next datablock in llist
+;       (1 - aec_MARK)  - integer mark field
+;       (2 - aec_CYCM)  - integer cycle number at time of peak moment
+;       (3 - aec_TM)    - time of peak moment
+;       (4 - aec_X)     - float - coordinate of x centroid
+;       (5 - aec_Y)     - float - coordinate of y centroid
+;       (6 - aec_M11)   - Seismic moment tensor component M11
+;       (7 - aec_M12)   -  "        "      "         "    M12 = (M12+M21)/2
+;       (8 - aec_M22)   -  "        "      "         "    M22
+;       (9 - aec_MMAX)  - Maximum magnitude so far
+;       (10 - aec_FIN)  - Boolean [0: active, 1: Finished]
+;       (11 - aec_AEHEAD) - ptr. head of llist of indivdual ae
+;       (12 - aec_AETAIL) - ptr. tail of llist of ae
+;
+;Global variables (public):
+;       aec_head   - head of llist of AEC datablocks
+;       aec_tail   - tail of llist of AEC datablocks
+;       ae_num     - total # of single (unclustered) AE
+;       aec_num    - total # of clusters
+;       ae_time0   - problem time when [ae_init] was called
+;
+;Related Functions (public) (in/out vars. designated by {}):
+;       ae_init     {i: ae_svel, ae_Q; o: ae_mkes, ae_alpha}
+;       ae_getdata  {i: aep; o: ...}
+;       ae_dumpall
+;       aec_getdata {i: aecp; o: ...)
+;       aec_dumpall
+;       ae_build   {i: ae_num}
+; ===================================================================
+
+@mpComputeMicroStrucProps
+
+
+def _ae_estimate_size
+  global ae_sz = int(3*mp_ng)              ; mp_ng number of grains in model, where a grain is a ball or clump    
+end
+@_ae_estimate_size
+
+def ae_arrays
+  Array ae_pt0(global.dim)
+  Array ae_pt1(global.dim)
+  Array _aec_cntrd(global.dim)
+  Array ae_all(ae_sz)
+  Array aec_all(ae_sz)
+  Array _aec_hostnum(10)  ; assume no more than 10 events will be overlapped by new event! ;no this array in xu
+  
+  array j_a(3,3)      ; input matrix for jacobian transformation
+  array j_d(3)          ; eigenvalues of j_a
+  array j_v(3,3)        ; eigenvectors of j_a
+  ;array j_eq(3,3)    ;xu said it is temporary matrix used in calculation of eigenvctors
+  ; initialise extra variables
+
+  command
+    contact extra 1 CPAE_FNINI    ; Initial normal force
+    contact extra 2 CPAE_FSINI    ; Initial shear force
+    contact extra 3 CPAE_AECNUM   ; AEC number, negative if contact is not to be counted
+    contact extra 4 CPAE_COUNT    ; Boolean indicator used to prevent contact being counted twice
+    ball extra  1  BPAE_AECNUM    ; AEC number, 0 if none
+  end_command
+; xu made the lines between command and end_command as notation
+end
+@ae_arrays
+;
+; ===================================================================
+; PUBLIC FUNCTIONS
+; ===================================================================
+;
+def ae_init
+;
+; ----- Initialize the ae-tracking mechanism.  All subsequent bond
+;       breaks will be stored as ae-events.
+;       This function is re-entrant --- i.e., if the package has
+;       already been initialized, all subsequent calls result in
+;       deletion of existing ae-data and reinitialization.
+;
+;       4 extra variables will be assigned to the contacts and any existing extra
+;       variables will be deleted.  The extra variables store info as follows:
+;       1- Initial contact normal force at time of bond breakage
+;       2- Initial contact shear force at time of bond breakage
+;       3- AEC number, negative if internal
+;       4- Boolean indicator to prevent contacts being counted twice
+;
+;       1 extra variable will be assigned to the balls as follows:
+;       1- AEC number
+;
+; INPUT:  ae_svel - shear velocity of material used to calculate duration of event.  
+;         ae_Q    - quality factor of the rock - attenuation parameter
+;
+; OUTPUT: aec_head
+;         aec_tail
+;         aec_num
+;         ae_num
+;         ae_time0
+;         ae_alpha
+;         ae_mkes
+;
+; Calculate dynamic damping coefficient
+;
+  global ae_alpha = math.pi/(2.0*ae_Q)
+  command
+    ball attribute damp  0.7
+  end_command
+  global _ae_dynflag = 0    ; flag to indicate if dynamic damping is on
+
+  global ae_mkes = int((mp_Dg / (0.5*ae_svel))/mech.timestep)  ;  assume width is one ball diameter
+;;version 4 is tdel, still can find some defination in 5.0,xu made it as global.timestep instead od mech.timestep
+;
+; Initialise contact offsets 
+;
+  global CPAE_FNINI  = 1   ; initial contact normal force
+  global CPAE_FSINI  = 2   ; initial contact shear force
+  global CPAE_AECNUM = 3  ; aec number
+  global CPAE_COUNT  = 4  ; boolean indicator if contact has been counted
+;xu has no global for the up 4 lines  
+
+  loop foreach local cp contact.list
+    contact.extra(cp,CPAE_FNINI) = 0.0
+    contact.extra(cp,CPAE_FSINI) = 0.0
+    contact.extra(cp,CPAE_AECNUM) = int(0)
+    contact.extra(cp,CPAE_COUNT) = int(0)
+  endloop
+
+;
+; Initialise ball offsets 
+  global BPAE_AECNUM=1
+  loop foreach  bp ball.list
+    ball.extra(bp,BPAE_AECNUM) = int(0)
+  endloop
+
+;
+  if _ae_reentrant = 1 then  ; will be zero upon first entrance£»_ae_reentrant
+    _ae_freellist
+  else
+    _ae_reentrant = 1
+    command
+      set fish callback bond_break _ae_formcb    
+      set fish callback bond_break _ae_formpb    
+      set fish callback 9.90 _ae_update_mt           
+    end_command 
+;xu has a 4th line in the command as set fish callback ball_delete _ae_delball
+	;
+  ; --- Define ae-datablock entry offsets
+  ;
+      ae_NEXT   = 0
+      ae_BALL1  = 1
+      ae_BALL2  = 2 
+      ae_CYC    = 3
+      ae_FAIL   = 4
+      ae_NUMDB  = 5 ; # entries in datablock
+  end_if
+;
+; --- Define aec-datablock entry offsets
+;
+    aec_NEXT   = 0
+    aec_MARK   = 1
+    aec_CYCM   = 2
+    aec_TM     = 3
+    aec_X      = 4
+    aec_Y      = 5
+    aec_M11    = 6
+    aec_M12    = 7
+    aec_M22    = 8
+    aec_MMAX   = 9
+    aec_FIN    = 10
+    aec_AEHEAD = 11
+    aec_AETAIL = 12
+    aec_NUMDB  = 13  ; # entries in datablock    
+;
+; --- Initialize global ae-related variables
+
+
+ global aec_head = null
+ global ae_head = null
+ global ae_time0 = time.clock     ;original is time, xu repalced with mech.age rather than time.clock
+ global aec_num = 0
+ global ae_num = 0
+end
+; ===================================================================
+def ae_getdata
+;
+; ----- Computes ae data for [ae] datablock.
+;
+; INPUT:  aep - pointer to ae datablock
+; OUTPUT: _ae_fail  - integer failure type (see ae_FAIL in datablock)
+;         _ae_ball1 - pointer to parent ball-1
+;         _ae_ball2 - pointer to parent ball-2
+;         _ae_x     - x-coordinate of event centroid
+;         _ae_y     - y_coordinate of event centroid
+;         _ae_z     - z_coordinate of event centroid (if global.dim=3)
+;         _ae_normx - x_component of crack unit-normal (ball1 to ball2)
+;         _ae_normy - y_component of crack unit-normal (ball1 to ball2)
+;         _ae_normz - z_component of crack unit-normal (ball1 to ball2)
+;                      (if global.dim=3)
+;         _ae_cyc   - cycle number when bond breakage occurred
+;
+; LOCAL:  vec12x, vec12y, vec12z - vector from ball1 to ball2
+;         bR1, bR2               - radii of balls 1 and 2
+;         dist                   - distance between ball centers
+;
+
+
+  _ae_ball1 = memory(aep+ae_BALL1)
+  _ae_ball2 = memory(aep+ae_BALL2)
+  _ae_mark  = memory(aep+ae_MARK)
+
+  _ae_getloc ;(O: _ae_x, _ae_y, _ae_normx, _ae_normy)
+
+  _ae_fail = int( memory(aep+ae_FAIL) )
+  _ae_cyc = int( memory(aep+ae_CYC) )
+
+
+ end
+;==============================================================
+def aec_getdata
+;
+; Computes ae data for entire cluster 
+;
+; INPUT - aecp - pointer to cluster datablock   
+;
+; OUTPUT:  _aec_cntrd - array of global.dim with centroid coordinates
+;          _aec_rad   - approximate radius of event
+;          _aec_time  - time of peak moment
+;          _aec_cyc0   - cycle of event start
+;          _aec_cycm  - cycle of peak moment
+;          _aec_mark  - mark field
+;          _aec_fin   - boolean indicator of status of event (0: active, 1: Finished)
+;          _aec_mag   - event magnitude calculated from KE
+;          _aec_aenum - number of cracks withing cluster
+;         _aec_M11   - Seismic moment tensor component M11
+;         _aec_M12   -  "        "      "         "    M12 = (M12+M21)/2
+;         _aec_M22   -  "        "      "         "    M22
+;         _aec_k     - isotropic component of MT
+;         _aec_T     - deviatoric component of MT
+;
+  _aec_aenum = 0
+  _xtot = 0.0
+  _ytot = 0.0
+  _ztot = 0.0
+  _aec_rad = 0.0
+
+  _aec_mark   = memory(aecp+aec_mark)
+  _aec_fin    = memory(aecp+aec_fin)
+  _aec_cycm   = memory(aecp+aec_cycm)
+  _aec_time   = memory(aecp+aec_TM)
+  _aec_M11    = memory(aecp+aec_M11)
+  _aec_M12    = memory(aecp+aec_M12)
+  _aec_M22    = memory(aecp+aec_M22)
+  _aec_cntrd(1) = memory(aecp+aec_X)
+  _aec_cntrd(2) = memory(aecp+aec_Y)
+
+ ; Calculate radius by finding crack furthest from centroid
+ ; Minimum radius is equal to one particle diameter
+ ; Also determine _aec_cyc0 by observing time of first crack
+ 
+  ae_pt0(1) = _aec_cntrd(1)
+  ae_pt0(2) = _aec_cntrd(2)
+  if global.dim = 3
+    ae_pt0(3) = _aec_cntrd(3)
+  end_if
+ 
+  aep = memory(aecp+aec_AEHEAD)
+  loop while aep # null
+    ae_getdata
+    _aec_aenum = _aec_aenum + 1
+    if _aec_aenum = 1
+      _aec_cyc0 = memory(aep+ae_cyc)
+    end_if
+
+     ae_pt1(1) = _ae_x
+     ae_pt1(2) = _ae_y
+     if global.dim = 3
+       ae_pt1(3) = _ae_z
+     end_if
+     _testrad = math.sqrt(_ae_distsq)
+     if _testrad > _aec_rad
+       _aec_rad = _testrad
+     end_if
+
+    aep = memory(aep+ae_next)
+  end_loop
+
+ _aec_rad = _aec_rad + mp_Dg  ; event extends one particle past furthes crack!
+
+; calculate magnitude, k and T
+
+  if _aec_m11 # 0
+    j_a(1,1) = _aec_m11
+    j_a(1,2) = _aec_m12
+    j_a(2,1) = _aec_m12
+    j_a(2,2) = _aec_m22
+    j_a(1,3) = 0.0
+    j_a(3,1) = 0.0
+    j_a(2,3) = 0.0
+    j_a(3,2) = 0.0
+    j_a(3,3) = 0.0
+    
+    jacobi    ;xu replaced it with two lines as jac_getvalues and jac_getvectors
+    jac_sort
+ 
+    _aec_moment = math.sqrt((j_d(1)^2+j_d(2)^2+j_d(3)^2)/2)  ; Silver and Jordan (1982)
+
+
+    _m = (j_d(1) + j_d(2) + j_d(3)) / 3.0 ; isotropic components
+    _mi = math.abs(_m)
+    _m11_d = j_d(1) - _m    ; deviatoric components
+    _m22_d = j_d(2) - _m
+    _m33_d = j_d(3) - _m
+    _md = math.max(math.abs(_m11_d),math.abs(_m33_d))  
+
+;    _aec_moment = _mi + _md   ; Bowers and Hudson, 1999
+
+    _aec_mag = (2.0/3.0)*math.log(_aec_moment)-6.0  ; Hanks and Kanamori, 1979
+
+    ; Calculate T and K for Hudson diagram
+
+    _aec_k = _m / (math.abs(_m)+_md)
+    _aec_T = 2*_m22_d / _md 
+
+  else
+    _aec_mag = -50  
+  end_if
+end
+;==============================================================================
+def ae_dumpall
+;
+; -------- Dump data for all ae to file 
+;
+; OUTPUT: aeall.out  - file containing ae data
+;
+  
+  _fn = 'aeall.out'
+  stat = file.open(_fn,1,1)
+  if global.dim = 2
+    ae_all(1) = 'cyc     x        y         type       cluster'
+  else
+    ae_all(1) = 'cyc     x        y       z       type     cluster'
+  end_if
+
+  local _count = 1                   ;xu has no local 
+  local _clusternum = 0              ;xu has no local 
+  aecp = aec_head
+  loop while aecp # null
+    _clusternum = _clusternum + 1
+    aep = memory(aecp+aec_aehead)
+    loop while aep # null
+
+      ae_getdata
+      _count = _count + 1
+      s1 = string(_ae_cyc)
+      s2 = string(_ae_x)
+      s3 = string(_ae_y)
+      if global.dim = 3
+        s4 = string(_ae_z)
+      end_if
+      s5 = string(_ae_fail)
+      s6 = string(_clusternum)
+
+      if global.dim = 2
+        ae_all(_count) = s1+' '+s2+' '+s3+' '+s5+' '+s6
+      else
+        ae_all(_count) = s1+' '+s2+' '+s3+' '+s4+' '+s5+' '+s6
+      end_if
+
+      aep = memory(aep+ae_NEXT)
+    end_loop
+    aecp = memory(aecp+aec_next)
+  end_loop
+   
+  stat = file.write(ae_all,_count)
+  stat = file.close()                 ;xu is stat = file.close() better to add the ()
+end
+;=============================================
+def aec_dumpall
+;
+; -------- Dump data for all ae clusters to file 
+;
+; OUTPUT: aecall.out  - file containing ae data
+;
+  
+  _fn = 'aecall.out'
+  stat = file.open(_fn,1,1)
+;  if global.dim = 2
+    aec_all(1) = 'cluster   cyc0    cycm    x      y    rad  mag   M11   M12   M22  aenum'
+;  else
+;    aec_all(1) = 'cluster   cyc0    cycm   x      y      z     rad  mag M11  M12  M22  aenum'
+;  end_if
+
+  _count = 1     ; for writing to array
+  _clusternum = 0
+  aecp = aec_head
+  loop while aecp # null
+    _clusternum = _clusternum + 1
+    aec_getdata
+
+    if _aec_mag > -50
+     _count = _count + 1
+      s1 = string(_clusternum)
+      s2 = string(_aec_cyc0)
+      s3 = string(_aec_cycm)
+      s4 = string(_aec_cntrd(1))
+      s5 = string(_aec_cntrd(2))
+      ;if global.dim = 3
+      ;  s6 = string(_aec_cntrd(3))
+      ;end_if
+      s7 = string(_aec_rad)
+      s8 = string(_aec_mag)
+      s9 = string(_aec_M11)
+      s10 = string(_aec_M12)
+      s11 = string(_aec_M22)
+      s12 = string(_aec_aenum)
+   
+     ; if global.dim = 2
+        aec_all(_count) = s1+' '+s2+' '+s3+' '+s4+' '+s5+' '+s7+' '+s8+' '+s9+' '+s10+' '+s11+' '+s12
+     ; else
+     ;   aec_all(_count) = s1+' '+s2+' '+s3+' '+s4+' '+s5+' '+s6+' '+s7+' '+s8+' '+s9+' '+s10+' '+s11+' '+s12
+     ; end_if
+    end_if
+    aecp = memory(aecp+aec_NEXT)
+  end_loop
+   
+  stat = file.write(aec_all,_count)
+  stat = file.close()
+end
+; ===================================================================
+def aec_dumptk
+;
+; Function to write T k values to file
+;
+; OUTPUT: tkall.tkd  - file containing ae data
+;
+  
+  _fn = 'tkall.tkd'
+  stat = file.open(_fn,1,1)
+  aec_all(1) = string(aec_num)
+
+  _count = 1
+  aecp = aec_head
+  loop while aecp # null
+    aec_getdata
+    if _aec_mag > -50
+      _count = _count + 1
+      s1 = string(_aec_T)
+      s2 = string(_aec_k)
+      aec_all(_count) = s1+'   '+s2
+    end_if
+    aecp = memory(aecp+aec_NEXT)
+    end_loop
+   
+  stat = file.write(aec_all,_count)
+  stat = file.close()
+end
+;========================================================
+def aec_dumpdecom
+;
+; Function to dump decompositon of moment tensors
+;
+; OUTPUT: tkall.tkd  - file containing ae data
+;
+  _fn = 'decomall.out'
+  stat = file.open(_fn,1,1)
+  aec_all(1) = 'Cluster    isotropic     deviatoric'
+
+  _count_arr = 1
+  _count_clus = 0
+  aecp = aec_head
+  loop while aecp # null
+    aec_getdata
+    _count_clus = _count_clus + 1
+    if _aec_mag > -50
+      _count_arr = _count_arr + 1
+      _aec_iso = 100 * _m * 3 / (3*_mi + math.abs(_m11_d) + math.abs(_m22_d) + math.abs(_m33_d))  ; Feigner and Young, 1992
+      _aec_dev = 100 - math.abs(_aec_iso)
+
+      s1 = string(_count_clus)
+      s2 = string(_aec_iso)
+      s3 = string(_aec_dev)
+      aec_all(_count_arr) = s1+'  '+s2+'  '+s3
+    end_if
+    aecp = memory(aecp+aec_NEXT)
+    end_loop
+   
+  stat = file.write(aec_all,_count_arr)
+  stat = file.close()
+end
+;==============================================================================
+; PRIVATE FUNCTIONS
+; ===================================================================
+;
+def _ae_newblock
+;
+; ----- Creates and initializes a new ae datablock. 
+;
+; OUTPUT: aep - pointer to the new block       
+;
+  aep = memory.create(ae_NUMDB)
+  memory(aep) = aep_head                         ;
+  ae_head = memory(aep)                          ;xu doesn't have these two additional lines.
+; --- Initialize datablock entries    ;
+  memory(aep+ae_NEXT)  = null
+  memory(aep+ae_BALL1) = null
+  memory(aep+ae_BALL2) = null
+  memory(aep+ae_CYC)  = int(0)
+  memory(aep+ae_FAIL)  = int(0)
+ end
+;=============================================================
+def _aec_newblock
+;
+; ----- Creates and initializes a new aec datablock.
+;
+; OUTPUT: aecp - pointer to the new block 
+;
+   aecp = memory.create(aec_NUMDB)
+  memory(aecp) = aec_head
+  aec_head = memory(aecp)
+  memory(aecp+aec_NEXT)  = null
+  memory(aecp+aec_MARK)= int(1)
+  memory(aecp+aec_CYCM)= int(0)
+  memory(aecp+aec_TM)  = float(0.0)
+  memory(aecp+aec_X)   = float(0.0)
+  memory(aecp+aec_Y)   = float(0.0)
+  memory(aecp+aec_M11) = float(0.0)
+  memory(aecp+aec_M12) = float(0.0)
+  memory(aecp+aec_M22) = float(0.0)
+  memory(aecp+aec_MMAX) = float(-50.0)
+  memory(aecp+aec_FIN)  = int(0)
+  memory(aecp+aec_AEHEAD) = null
+  memory(aecp+aec_AETAIL) = null
+
+end
+; ===================================================================
+def _ae_freellist
+;
+; ----- Destroy entire llist of ae datablocks and free the memory.
+;
+; INPUT: aec_head   
+;
+local ii = io.out('[_ae_freellist]: Freeing memory used to store all AE datablocks.')   ;xu has no local ii =
+
+  aecp_ = aec_head
+  loop while aecp_ # null
+    aep = memory(aecp+aec_aehead)
+    loop while aep # null
+      aepnxt = memory(aep+ae_NEXT)
+      kk = memory.delete(ae_NUMDB,aep)
+      aep = aepnxt
+    end_loop
+
+    aecpnxt = memory(aecp+aec_NEXT)
+    kk = memory.delete(aec_NUMDB,aecp)
+    aecp = aecpnxt
+  end_loop
+end
+; ===================================================================
+def _ae_formcb(arr)
+;
+; ----- Form event as result of contact bond breakage.
+;       Create ae datablock.   
+;
+;       Checks if it's a new event (if ALL contacts associated with new crack
+;                                    have 3rd extra var = 0)
+;         in this case a new aec block is created 
+;         and the ae block is added to it 
+;       Otherwise (one of the contacts has a non-zero 3rd extra var.)
+;         the ae block is added to an exisiting aec list.
+
+;       (Register via "set fishcall FC_BOND_DEL _ae_formcb".)
+;
+ 
+ cp = arr(1)
+ failmode = arr(2)   ;
+  ae_num = ae_num + 1    ;
+
+  if _ae_dynflag = 0    ;
+    command
+      ball attribute damp  @ae_alpha   ;
+    end_command
+    _ae_dynflag = 1         ;
+  end_if
+
+  _ae_newblock ; {O: aep}     ;
+
+ 
+   memory(aep+ae_BALL1) =  contact.end1(cp)
+   memory(aep+ae_BALL2) = contact.end2(cp)
+
+  if failmode = 0 then  ; normal failure
+    memory(aep+ae_FAIL) = 1
+  end_if
+  if failmode = 1 then  ; shear failure
+    memory(aep+ae_FAIL) = 2
+  end_if
+    
+  memory(aep+ae_CYC) = int( mech.step )
+
+; Check to see if crack is within proximity of an existing event  
+
+    _bp1chk = contact.end1(cp)      ;
+    _bp2chk = contact.end2(cp)
+ 
+  _ae_checkcrack  ; {In - _bp1chk, _bp2chk; 
+;                   Out  - _aec_hostnum number of overlapped events (all 0 if none)
+;                         
+;      
+
+  if _aec_hostnum > 0 ; a ball is within proximity of active event
+      aecp = _aecp_host ; [I: _aec_hostnum_scalar)
+      _tail = memory(aecp+ aec_AETAIL) ; adds ae datablock to active event 
+      memory(_tail + ae_NEXT) = aep       
+      memory(aecp+ aec_AETAIL) = aep
+  else
+
+    ; No balls within proximity of active event
+    ; create new aecp block
+
+    aec_num = aec_num + 1
+    _aec_hostnum = int(aec_num)
+    _aec_newblock   ; {O: aecp}
+    
+    if aec_head = null then
+      aec_head = aecp
+      aec_tail = aecp
+    else
+      memory(aec_tail+aec_NEXT) = aecp
+      aec_tail = aecp
+    end_if
+    memory(aecp + aec_AEHEAD) = aep
+    memory(aecp + aec_AETAIL) = aep
+    memory(aecp + aec_MARK) = int(1)
+    memory(aecp + aec_FIN) = int(0)
+
+  end_if
+
+; Calculate new centroid
+
+  _xtot = 0.0
+  _ytot = 0.0
+  _ae_count = 0
+  aep = memory(aecp+aec_aehead)
+  loop while aep # null
+    _ae_count = _ae_count + 1
+    _ae_getloc ; [I: aep;  O: _ae_x, _ae_y]
+    _xtot = _xtot + _ae_x
+    _ytot = _ytot + _ae_y
+    aep = memory(aep+ae_next)
+  end_loop
+
+  memory(aecp+aec_X) = _xtot / _ae_count
+  memory(aecp+aec_Y) = _ytot / _ae_count
+
+; Fill extra variables of contacts with initial forces and event info
+
+   _bp1fill = contact.end1(cp)
+   _bp2fill = contact.end2(cp)
+   _ae_fill_extra ;(i: _bp1fill, _bp2fill, _aec_hostnum_scalar)
+end
+; ===================================================================
+def _ae_formpb(arr)
+;
+; ----- Form event as result of parallel bond breakage.
+;       Create ae datablock.
+;
+;       Checks if it's a new event (if ALL contacts associated with new crack
+;                                    have 3rd extra var = 0)
+;         in this case a new aec block is created
+;         and the ae block is added to it
+;       Otherwise (one of the contacts has a non-zero 3rd extra var.)
+;         the ae block is added to an exisiting aec list.
+
+;       (Register via "set fishcall FC_PB_DEL _ae_formpb".)
+;
+
+  cp = arr(1)
+  failmode = arr(2)
+  ae_num = ae_num + 1
+
+  if _ae_dynflag = 0
+    command
+      ball attribute damp  @ae_alpha
+    end_command
+    _ae_dynflag = 1
+  end_if
+
+  _ae_newblock ; {O: aep}
+
+  memory(aep+ae_BALL1) = contact.end1(cp)
+  memory(aep+ae_BALL2) = contact.end2(cp)
+
+  if failmode = 0 then  ; normal failure
+    memory(aep+ae_FAIL) = 3
+  end_if
+  if failmode = 1 then  ; shear failure
+    memory(aep+ae_FAIL) = 4
+  end_if
+    
+  memory(aep+ae_CYC) = int( mech.step )
+
+;
+; Check to see if crack is within proximity of an existing event
+;
+    _bp1chk = contact.end1(cp)
+    _bp2chk = contact.end2(cp)
+ 
+  _ae_checkcrack  ; {In - _bp1chk, _bp2chk; 
+;                   Out  - _aec_hostnum[] - array of overlapped events (all 0 if none)
+;                          _aec_mergenum  - number of overlapped events      
+
+  if _aec_hostnum > 0 ; a ball is within proximity of active event
+     aecp = _aecp_host ; [I: _aec_hostnum_scalar)
+    _tail = memory(aecp+ aec_AETAIL) ; adds ae datablock to active event list
+    memory(_tail + ae_NEXT) = aep
+    memory(aecp+ aec_AETAIL) = aep
+  else
+
+    ; No balls within proximity of active event
+    ; create new aecp block
+
+    aec_num = aec_num + 1
+    _aec_hostnum = int(aec_num)
+    _aec_newblock   ; {O: aecp}
+    
+    if aec_head = null then
+      aec_head = aecp
+      aec_tail = aecp
+    else
+      memory(aec_tail+aec_NEXT) = aecp
+      aec_tail = aecp
+    end_if
+    memory(aecp + aec_AEHEAD) = aep
+    memory(aecp + aec_AETAIL) = aep
+    memory(aecp + aec_MARK) = int(1)
+    memory(aecp + aec_FIN) = int(0)     
+
+  end_if
+
+; Calculate new centroid 
+
+  _xtot = 0.0
+  _ytot = 0.0
+  _ae_count = 0
+  aep = memory(aecp+aec_aehead)
+  loop while aep # null
+    _ae_count = _ae_count + 1
+    _ae_getloc ; [I: aep;  O: _ae_x, _ae_y]
+    _xtot = _xtot + _ae_x
+    _ytot = _ytot + _ae_y
+    aep = memory(aep+ae_next)
+  end_loop
+
+  memory(aecp+aec_X) = _xtot / _ae_count   
+  memory(aecp+aec_Y) = _ytot / _ae_count
+
+; Fill extra variables of contacts with initial forces and event info
+   _bp1fill = contact.end1(cp)
+   _bp2fill = contact.end2(cp)
+   _ae_fill_extra ;(i: _bp1fill, _bp2fill, _aec_hostnum_scalar)
+end
+;=================================================================
+def _ae_update_mt
+
+; ----- Update moment tensors in all active AE blocks
+;
+
+  aecpp    = aec_head
+  _active = 0
+
+  loop while aecpp # null
+
+    if memory(aecpp+aec_FIN) = 0
+
+      ;
+      ; Get cycle of latest crack 
+      ;
+      _cyc_latest = 0
+      aep = memory(aecpp+aec_AEHEAD)
+      loop while aep # null
+        if memory(aep+ae_cyc) > _cyc_latest
+         _cyc_latest = memory(aep+ae_cyc)
+        end_if
+        aep = memory(aep + ae_next)
+      end_loop
+  
+      if mech.step - _cyc_latest > ae_mkes
+        memory(aecpp+aec_FIN) = int(1)      
+        _aecpn = aecpp
+        _aec_nullcon ; {I: _aecpn}
+
+      else
+        _aecpmt  = aecpp
+        _aec_mt ; (i: _aecpmt, o: _m11, _m12, _m22, _mag)
+
+        if _mag > memory(aecpp+aec_MMAX)
+          memory(aecpp+aec_MMAX) = _mag
+          memory(aecpp+aec_CYCM) = mech.step
+          memory(aecpp+aec_TM)   = time.clock - ae_time0
+          memory(aecpp+aec_M11) = _m11
+          memory(aecpp+aec_M12) = _m12
+          memory(aecpp+aec_M22) = _m22
+        endif
+        _active = _active + 1
+      endif  
+    end_if  ; aec_FIN = 0
+    aecpp  = memory(aecpp+aec_next)
+  end_loop
+
+  ; turn on full damping if no active events
+
+  if _active = 0
+    if _ae_dynflag = 1
+      command
+        ball attribute damp  0.7
+      end_command
+      _ae_dynflag = 0
+    end_if
+  end_if
+end
+;==============================================================
+def _ae_fill_extra
+;
+; Function to fill extra variables of surrounding contacts with initial forces
+;
+; INPUT _bp1fill, _bp2fill  - pointers to event balls
+;       _aec_hostnum - overlapped event number 
+;
+
+; Fill ball extra variables
+
+  ball.extra(_bp1fill,BPAE_AECNUM) = int(_aec_hostnum)
+  ball.extra(_bp2fill,BPAE_AECNUM) = int(_aec_hostnum)
+
+ ; loop over two balls
+
+
+   
+     loop jj (1,2)
+      if jj = 1
+       _bpf = _bp1fill
+      else
+       _bpf = _bp2fill
+      end_if
+	
+       loop foreach  cpp ball.contactmap(_bpf) 
+        ;local clist = ball.contactmap(_bpf)
+        ;loop foreach local cpp clist
+        if contact.extra(cpp,CPAE_AECNUM) = 0                 ; contact is not already being counted
+          contact.extra(cpp,CPAE_FNINI) = contact.force.normal(cpp) 
+          contact.extra(cpp,CPAE_FSINI) = contact.force.shear(cpp)
+           ;pbp = contact.prop(cpp,'linearpbond')
+           ;if pbp # null
+            ;if contact.model(cpp)='linearpbond'
+             loop foreach pbp contact.list('ball-ball')
+              if contact.model(pbp)='linearpbond'
+              ;un1               = contact.normal.x(cpp)  
+              ;un2               = contact.normal.y(cpp) 		   
+            contact.extra(cpp,CPAE_FNINI) = contact.extra(cpp,CPAE_FNINI) + comp.x(contact.prop(pbp,'pb_force'))
+            contact.extra(cpp,CPAE_FSINI) = contact.extra(cpp,CPAE_FSINI) + comp.y(contact.prop(pbp,'pb_force'))
+   			;end_if
+            contact.extra(cpp,CPAE_AECNUM) = int(_aec_hostnum)
+        else ; contact.extra # 0   
+             if type.pointer.id(contact.end2(cpp)) = ball.typeid  ; a ball 
+              if ball.extra(contact.end1(cpp),BPAE_AECNUM) = _aec_hostnum
+               if ball.extra(contact.end2(cpp),BPAE_AECNUM) = _aec_hostnum  ; contact will be internal
+                if contact.extra(cpp,CPAE_AECNUM) > 0
+                  contact.extra(cpp,CPAE_AECNUM) = int(-1*contact.extra(cpp,CPAE_AECNUM))
+                end_if
+               end_if
+              end_if
+             end_if
+			end_if
+           end_if
+        end_loop
+     end_loop
+   end_loop
+end
+;=======================================================
+def _aec_mt
+
+; Function to calculate moment tensor and magnitude
+;
+; INPUT:  _aecpmt   ;
+;
+; OUTPUT: _m11, _m12, _m22  - elements of moment tensor     
+;         _mag              - magnitude                     
+;
+
+  global _m11 = 0
+  global _m12 = 0
+  global _m22 = 0
+  
+  aep = memory(_aecpmt+aec_aehead)
+  loop while aep # null
+    _bp1mt = memory(aep+ae_ball1)
+    _bp2mt = memory(aep+ae_ball2)
+
+  ; Loop through two balls
+  
+    loop gg (1,2)
+      if gg = 1
+        _bpmt = _bp1mt
+      else
+        _bpmt = _bp2mt
+      end_if
+
+	 ;loop foreach local cpmt ball.contactmap.all(_bpmt) 
+     local clist = ball.contactmap(_bpmt)  
+     loop foreach local cpmt clist
+     
+        if contact.extra(cpmt,CPAE_COUNT) = 0 then             ; 
+          if contact.extra(cpmt,CPAE_AECNUM) > 0
+            cpv = cpmt
+            if _ae_nonvirtual = 1  ; can't calculate normals for virtual contact
+			
+           ; calculate forces  
+		   loop foreach pbp contact.list('ball-ball')
+              if contact.model(pbp)='linearpbond'
+		    ; if contact.model(cpmt)='linearpbond'
+			 
+
+			   
+                _dnforce = contact.force.normal(cpmt) + com.x(contact.prop(pbp,'pb_force')) - contact.extra(cpmt,CPAE_FNINI)
+                _dsforce = contact.force.shear(cpmt)  + com.y(contact.prop(pbp,'pb_force')) - contact.extra(cpmt,CPAE_FSINI)
+			  else
+                _dnforce = contact.force.normal(cpmt) - contact.extra(cpmt,CPAE_FNINI)
+                _dsforce = contact.force.shear(cpmt) - contact.extra(cpmt,CPAE_FSINI)			  
+              end_if
+             
+            
+              ; decompose forces   
+    
+                un1               = contact.normal.x(cpmt)  
+                un2               = contact.normal.y(cpmt) 
+  
+              ; check that unit normal is pointing INTO the ball
+ 
+              local _testx = contact.pos.x(cpmt) + un1*ball.radius(_bpmt)
+              local _testy = contact.pos.y(cpmt) + un2*ball.radius(_bpmt)  
+              _testdist = math.sqrt((_testx - ball.pos.x(_bpmt))^2+(_testy - ball.pos.y(_bpmt))^2)
+              if _testdist > ball.radius(_bpmt)
+                un1 = -un1
+                un2 = -un2
+              end_if
+            
+              cf1               = _dnforce * un1 - _dsforce * un2  ;
+              cf2               = _dnforce * un2 + _dsforce * un1  ;
+              cf1 = -cf1
+              cf2 = -cf2
+
+              ; get distance to centroid 
+
+              _rx = contact.pos.x(cpmt) - memory(_aecpmt+aec_X)  ;
+              _ry = contact.pos.y(cpmt) - memory(_aecpmt+aec_Y)  ;
+
+            ; add to MT
+  
+              _m11  = _m11 + cf1 * _rx        ;
+              _m12  = _m12 + (cf1 * _ry + cf2 * _rx) / 2.0     
+              _m22  = _m22 + cf2 * _ry        
+          end_if
+          end_if
+          contact.extra(cpmt,CPAE_COUNT) = int(1)   ; Has now been counted 
+        end_if
+        end_loop
+          
+        
+      end_loop
+    end_loop
+    aep = memory(aep+ae_next)  ;
+  end_loop
+
+  _aec_zerocon  ; set contact extra variable4 back to 0 for all contacts in this event
+                ; [I: _aecpmt]  
+
+; calculate magnitude, T and K
+
+  if _m11 # 0
+    j_a(1,1) = _m11
+    j_a(1,2) = _m12
+    j_a(2,1) = _m12
+    j_a(2,2) = _m22
+    j_a(1,3) = 0.0
+    j_a(3,1) = 0.0
+    j_a(2,3) = 0.0
+    j_a(3,2) = 0.0
+    j_a(3,3) = 0.0
+ 
+    jacobi
+    jac_sort
+ 
+    _moment = math.sqrt((j_d(1)^2+j_d(2)^2+j_d(3)^2)/2)  ; Silver and Jordan (1982)
+                                                    ; Note - one of these values will be 0
+
+    _m = (j_d(1) + j_d(2) + j_d(3)) / 3 ; isotropic components
+    _mi = math.abs(_m)
+    _m11_d = j_d(1) - _m    ; deviatoric components
+    _m22_d = j_d(2) - _m
+    _m33_d = j_d(3) - _m
+    _md = math.max(math.abs(_m11_d),math.abs(_m33_d))  
+
+;    _ae_moment = _mi + _md   ; Bowers and Hudson, 1999
+
+    _mag = (2.0/3.0)*math.log(_moment)-6.0  ; Hanks and Kanamori, 1979
+  else
+    _mag = -50  
+  end_if
+
+; Calculate T and K for Hudson diagram
+; This is only here for testing - it will be recalculated in ae_getdata
+
+;  _k = _m / (math.abs(_m)+_md)
+;  _T = 2*_m22_d / _md 
+end
+;=================================================================
+def _aec_zerocon
+;
+; Function to set all extra variable 4 back to zero for an event
+; INPUT: _aecpmt  ; pointer to event  
+
+  aep = memory(_aecpmt+aec_aehead)     ;
+  loop while aep # null
+    _bp1z = memory(aep+ae_ball1)        ;
+    _bp2z = memory(aep+ae_ball2)
+
+  ; Loop through balls
+
+    loop nn (1,2)
+      if nn = 1
+         _bpz = _bp1z
+      else
+         _bpz = _bp2z
+      end_if
+
+	  loop foreach local cpmt ball.contactmap.all(_bpz)
+        contact.extra(cpmt,CPAE_COUNT) = int(0)
+        
+      end_loop
+    end_loop
+  aep = memory(aep+ae_next)
+  end_loop
+end
+;==================================================================
+def _aec_nullcon
+;
+; Function to turn all extra variables to 0 for finished event
+;
+;  INPUT:  _aecpn  ; pointer to event
+;
+
+  aep = memory(_aecpn+aec_AEHEAD)
+  loop while aep # null
+    
+    _bp1n = memory(aep+ae_ball1)
+    _bp2n = memory(aep+ae_ball2)
+    ball.extra(_bp1n,BPAE_AECNUM) = int(0)
+    ball.extra(_bp2n,BPAE_AECNUM) = int(0)
+
+   ; Loop through balls
+
+    loop pp (1,2)
+      if pp = 1
+         _bpnc = _bp1n
+      else
+         _bpnc = _bp2n
+      end_if
+	  
+      loop foreach local cpn ball.contactmap.all(_bpnc)
+     
+        contact.extra(cpn,CPAE_FNINI) = 0.0  
+        contact.extra(cpn,CPAE_FSINI) = 0.0
+        contact.extra(cpn,CPAE_AECNUM) = int(0)
+		
+      end_loop
+    end_loop
+
+    aep = memory(aep+ae_NEXT)
+  end_loop
+end
+;======================================================
+def _ae_checkcrack
+;
+; Function to determine if new crack is within region of existing active event
+; or if there is overlap between event areas  
+;
+;  INPUT: _bp1chk, _bp2chk - addresses of balls to be checked
+;
+;  OUTPUT:   _aec_hostnum -  number of exisiting events (all 0 if none)  
+
+;
+
+
+    _aec_hostnum = int(0)
+
+  
+   _bpgc1 = _bp1chk
+   _bpgc2 = _bp2chk
+
+  _cp_crack = _ae_getcp    
+
+   ;if contact.extra(_cp_crack,CPAE_AECNUM) # 0
+   ;  _aec_hostnum = int(math.abs(contact.extra(_cp_crack,CPAE_AECNUM)))
+	; exit
+   ;end_if
+   
+    ; Loop through balls
+
+    loop qq (1,2)
+      if qq = 1
+       _bpc = _bp1chk
+      else
+        _bpc = _bp2chk
+      end_if   
+
+
+  ;loop foreach local cpp ball.contactmap.all(_bpc) 
+  local clist = ball.contactmap(_bpc)
+  loop foreach local cpp clist
+     if contact.extra(cpp,CPAE_AECNUM) # 0
+           _aec_hostnum = int(math.abs(contact.extra(cpp,CPAE_AECNUM)))
+           exit
+       end_if
+      end_loop 
+   end_loop
+end
+;======================================================
+def _aecp_host
+
+; Function to get pointer address of an event from an event number
+;
+; INPUT: _aec_hostnum_scalar : number of event
+;
+  local _aec_count = 0
+  aecph = aec_head
+  loop while aecph # null
+    _aec_count = _aec_count + 1
+    if _aec_count = _aec_hostnum
+      _aecp_hosthold = aecph
+    end_if
+    aecph = memory(aecph + aec_NEXT)
+  end_loop
+  _aecp_host = _aecp_hosthold
+end   
+;==============================================================
+def _ae_getcp
+;
+; Function to get contact pointer from two ball pointers
+;
+; INPUT: _bpgc1, _bpgc2 - balls for which contact is require
+   
+    _cp_temp = null
+
+   loop foreach  local con ball.contactmap(_bpgc1)
+    if contact.end1(con) = _bpgc2 then
+      _cp_temp =  con
+    end_if
+    if contact.end2(con) = _bpgc2 then
+      _cp_temp = con
+    end_if 
+    if contact.end1(con) = _bpgc1 then
+	  con = contact.end1(con)
+	  else
+	  con = contact.end2(con)
+    end_if
+     
+  end_loop
+  _ae_getcp = _cp_temp
+end
+
+;================================================================
+def _ae_getloc
+;
+; ---- Function to get location of ae contact
+;
+;
+; INPUT  : aep  - pointer to ae event
+; OUTPUT : _ae_x, _ae_y
+;
+    _bp1 = memory(aep+AE_ball1)
+    _bp2 = memory(aep+AE_ball2)
+
+    bR1 = ball.radius(_bp1)
+    bR2 = ball.radius(_bp2)
+
+    vec12x = ball.pos.x(_bp2) - ball.pos.x(_bp1)
+    vec12y = ball.pos.y(_bp2) - ball.pos.y(_bp1)
+	dist = math.sqrt( vec12x*vec12x + vec12y*vec12y )
+      _ae_normx = vec12x / dist
+      _ae_normy = vec12y / dist
+  
+   _ae_gap = dist - bR1 - bR2
+
+  mult = bR1 + (_ae_gap / 2.0)
+  _ae_x = ball.pos.x(_bp1) + mult * _ae_normx
+  _ae_y = ball.pos.y(_bp1) + mult * _ae_normy
+  
+end
+;=================================================================
+def _ae_distsq
+;
+; ----- Return the distance-squared between the two points designated by
+;       the two input parameters of  
+;
+; INPUT: ae_pt0(global.dim), ae_pt1(global.dim)
+;
+  _delx = ae_pt1(1) - ae_pt0(1)
+  _dely = ae_pt1(2) - ae_pt0(2)
+     _distsq = _delx^2 + _dely^2
+     _ae_distsq = _distsq
+end
+;=====================================================================  
+def _ae_nonvirtual
+;
+; Checks if contact is virtual  
+;
+; INPUT:   cpv  - contact pointer to be checked
+;
+; OUTPUT:  0  - contact is virtual
+;          1  - contact is real and physical
+; 
+  _aev_flag = 0
+  if contact.active(cpv) = 1 then  ; cbond props. were created
+   if type.pointer(contact.end2(cpv)) = 'ball-ball' then  ; it is a ball-ball contact,
+                                             ; walls are always c_ball2(cp)
+     _aev_flag = 1
+   end_if
+ end_if
+
+
+ if contact.model(cpv)='linearpbond'
+ ;if c_pb(cpv) # null then
+   _aev_flag = 1
+  end_if
+
+  if contact.force.normal(cpv) # 0.0 then
+   _aev_flag = 1
+ end_if
+
+;
+  _ae_nonvirtual = _aev_flag
+
+end
+;=====================================================================  
+def jacobi
+;
+; Gets eigenvectors and eigenvalues of a 3D matrix   
+;
+; INPUT     - j_a(3,3)        - input matrix
+;
+; OUTPUT    - j_d(3)          - 
+;             j_v(3,3)        - eigenvectors - not yet!
+
+  _error_flag = 0
+
+  _a = -j_a(1,1) - j_a(2,2) - j_a(3,3)  ; coefficient of lambda squared 
+  ; coefficient of lambda  
+  _b = -j_a(2,3)*j_a(3,2)-j_a(2,1)*j_a(1,2)-j_a(3,1)*j_a(1,3)+j_a(1,1)*j_a(2,2)+j_a(3,3)*j_a(1,1)+j_a(3,3)*j_a(2,2)
+  ; constant
+  _c = -j_a(1,1)*j_a(2,2)*j_a(3,3)-j_a(2,1)*j_a(1,3)*j_a(3,2)-j_a(3,1)*j_a(1,2)*j_a(2,3)
+  _c = _c + j_a(1,1)*j_a(2,3)*j_a(3,2)+j_a(2,1)*j_a(1,2)*j_a(3,3)+j_a(3,1)*j_a(1,3)*j_a(2,2)
+
+  ; solve cubic a ccording to Numerical Recipes in C, Press et al., 1992, page 184
+
+  _Q = (_a^2 - 3*_b)/9.0
+  _R = (2*_a^3-9*_a*_b+27*_c)/54.0
+
+   ; Need to recalculate numerator and denominator because arccos does not exist in PFC 
+
+  _thet = math.atan2(math.sqrt(_Q^3 - _R^2),_R)
+
+  j_d(1) = -2*math.sqrt(_Q)*math.cos(_thet/3)-_a/3.0
+  j_d(2) = -2*math.sqrt(_Q)*math.cos((_thet+2*math.pi)/3)-_a/3.0
+  j_d(3) = -2*math.sqrt(_Q)*math.cos((_thet-2*math.pi)/3)-_a/3.0
+
+end
+;=====================================================
+def jac_sort
+;
+; Sorts eigenvalues into descending order   
+; INPUT j_d(1..3)
+;
+  loop vv (2,3)
+    if j_d(vv) > j_d(1)
+      _temp = j_d(1)
+      j_d(1) = j_d(vv)
+      j_d(vv) = _temp
+    end_if
+  end_loop
+  if j_d(3) > j_d(2)
+    _temp = j_d(2)
+    j_d(2) = j_d(3)
+    j_d(3) = _temp
+  end_if
+end
+;=======================================================
+return
